@@ -1,176 +1,131 @@
-#include "pch.h"
 #include "connection.h"
+#include "server.h"
 
-void reportError(SSL* ssl, int result)
+using namespace std;
+
+Connection::Connection(Config& config):
+    config(config), closed(false), dst_closed(false)
 {
-	if (result <= 0)
-	{
-		int error = SSL_get_error(ssl, result);
+    Server* server = reinterpret_cast<Server*>(config.data);
+    socket = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
+    dst_socket = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
 
-		switch (error)
-		{
-		case SSL_ERROR_ZERO_RETURN:
-			std::cout << "SSL_ERROR_ZERO_RETURN" << std::endl;
-			break;
-		case SSL_ERROR_NONE:
-			std::cout << "SSL_ERROR_NONE" << std::endl;
-			break;
-		case SSL_ERROR_WANT_READ:
-			std::cout << "SSL_ERROR_WANT_READ" << std::endl;
-			break;
-		default:
-			{
-				char buffer[256];
-
-				while (error != 0)
-				{
-					ERR_error_string_n(error, buffer, sizeof(buffer));
-
-					std::cout << "Error: " << error << " - " << buffer << std::endl;
-
-					error = ERR_get_error();
-				}
-			}
-
-			break;
-		}
-	}
+    uv_tcp_init(server->loop, (uv_tcp_t*)socket);
+    uv_tcp_init(server->loop, (uv_tcp_t*)dst_socket);
+    socket->data = this;
+    dst_socket->data = this;
+    uv_ip4_addr(config.dst_host.c_str(), config.dst_port, &addr);
 }
 
-Connection::Connection(SSL_CTX* ssl_ctx, uv_tcp_t* socket):_ssl_init_finished(false),_ssl_handshake_finished(false)
+int Connection::accept()
 {
-	_ssl_ctx = ssl_ctx;
-	_ssl = SSL_new(_ssl_ctx);
-	_server = (Server*)socket->data;
-	_socket = socket;
-	_socket->data = this;
-	_read_bio = BIO_new(BIO_s_mem());
-	_write_bio = BIO_new(BIO_s_mem());
-	SSL_set_bio(_ssl, _read_bio, _write_bio);
-	SSL_set_accept_state(_ssl);
-	uv_read_start((uv_stream_t*)_socket, Connection::on_alloc, Connection::on_read);
+    Server* server = reinterpret_cast<Server*>(config.data);
+    return uv_accept(&server->socket, socket);
 }
 
-Connection::~Connection()
+void Connection::start()
 {
-	BIO_free(_write_bio);
-	BIO_free(_read_bio);
-	SSL_free(_ssl);
-	std::cout << "client closed" << std::endl;
+    connect_to_dst();
 }
 
 void Connection::close()
 {
-	uv_shutdown_t* req = (uv_shutdown_t*)malloc(sizeof(uv_shutdown_t));
-	uv_shutdown(req, (uv_stream_t*)_socket, Connection::on_shutdown);
+    uv_shutdown((uv_shutdown_t*)malloc(sizeof(uv_shutdown_t)), socket, Connection::on_shutdown);
+    uv_shutdown((uv_shutdown_t*)malloc(sizeof(uv_shutdown_t)), dst_socket, Connection::on_shutdown);
 }
 
-void Connection::write_to_socket(char* buf, unsigned int size)
+int Connection::write_to_peer(uv_stream_t* peer, char* buf, size_t size)
 {
-	uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
-	uv_buf_t b = uv_buf_init(buf, size);
-
-	uv_write(req, (uv_stream_t*)_socket, &b, 1, Connection::on_write);
+    uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
+    uv_buf_t b = uv_buf_init(buf, size);
+    return uv_write(req, peer, &b, 1, Connection::on_write);
 }
 
-void Connection::flush_write_bio()
+void Connection::connect_to_dst()
 {
-	char buf[65536];
-	memset(buf, 0, sizeof(buf));
-	int bytes = 0;
-	while((bytes = BIO_read(_write_bio, buf, sizeof(buf))) > 0)
-	{
-		write_to_socket(buf, bytes);
-	}
+    int r = uv_tcp_connect(&req, (uv_tcp_t*)dst_socket, (sockaddr*)&addr, Connection::on_connect);
+    if(r < 0) {
+        cout << uv_err_name(r) << endl;
+    }
 }
 
-void Connection::procced()
+void Connection::on_connect(uv_connect_t* req, int status)
 {
-	if(!SSL_is_init_finished(_ssl))
-	{
-		std::cout << "SSL_is_init_finished x" << std::endl;
-		int r = SSL_accept(_ssl);
-		if(r <= 0)
-		{
-			std::cout << "SSL_accept x" << std::endl;
-			if(SSL_get_error(_ssl, r) == SSL_ERROR_WANT_READ)
-			{
-				flush_write_bio();
-			}
-		}
-		else
-		{
-			std::cout << "SSL_accept o" << std::endl;
-			//SSL_write(_ssl, "hello", 5);
-			flush_write_bio();
-		}
-
-	}
-	else
-	{
-		std::cout << "SSL_is_init_finished o" << std::endl;
-		int nread = 0;
-		char* buf = (char*)malloc(10240);
-		while((nread = SSL_read(_ssl, buf, sizeof(buf))) > 0)
-		{
-			std::copy(buf, buf+nread, std::ostream_iterator<char>(std::cout));
-		}
-		free(buf);
-	}
+    if(status == 0)
+    {
+        Connection* conn = reinterpret_cast<Connection*>(req->handle->data);
+        uv_read_start(conn->socket, on_alloc, on_read);
+        uv_read_start(conn->dst_socket, on_alloc, on_dst_read);
+    }
 }
 
-//////////////////////////////////////////////////////////////
-// static functions
-//////////////////////////////////////////////////////////////
-
-void Connection::on_read(uv_stream_t* socket, ssize_t nread, const uv_buf_t* buf)
+void Connection::on_alloc(uv_handle_t* /*con*/, size_t size, uv_buf_t* buf)
 {
-	Connection* conn = static_cast<Connection*>(socket->data);
-	if(nread < 0)
-	{
-		conn->close();
-	}
-	else if(nread == 0)
-	{
-		conn->close();
-		// really?
-	}
-	else
-	{
-		int nwritten = 0;
-		while(nwritten < nread) {
-			std::cout << "written bytes: " << nwritten <<  " of " << nread << std::endl;
-			nwritten += BIO_write(conn->_read_bio, buf->base + nwritten, nread - nwritten);
-		}
-
-		conn->procced();
-	}
-
-	if(buf->base) free(buf->base);
-}
-
-void Connection::on_alloc(uv_handle_t* con, size_t size, uv_buf_t* buf)
-{
-	buf->base = (char*)malloc(size);
-	buf->len = size;
+    buf->base = (char*)malloc(size);
+    buf->len = size;
 }
 
 void Connection::on_shutdown(uv_shutdown_t* req, int status)
 {
-	uv_close((uv_handle_t*)req->handle, Connection::on_close);
-	free(req);
+    if(status == 0)
+    {
+        uv_close((uv_handle_t*)req->handle, Connection::on_close);
+        free(req);
+    }
 }
 
 void Connection::on_close(uv_handle_t* handle)
 {
-	Connection* conn = (Connection*)handle->data;
-	delete conn;
-	free(handle);
+    Connection* conn = reinterpret_cast<Connection*>(handle->data);
+    if((uv_handle_t*)conn->dst_socket == handle) conn->dst_closed = true;
+    if((uv_handle_t*)conn->socket == handle) conn->closed = true;
+    free(handle);
+    if(conn->dst_closed && conn->closed)
+        delete conn;
+}
+
+void Connection::on_read(uv_stream_t* socket, ssize_t nread, const uv_buf_t* buf)
+{
+    Connection* conn = static_cast<Connection*>(socket->data);
+    if(nread < 0)
+    {
+        conn->close();
+    }
+    else if(nread == 0)
+    {
+        conn->close();
+        // really?
+    }
+    else
+    {
+        conn->write_to_peer(conn->dst_socket, buf->base, nread);
+    }
+
+    if(buf->base) free(buf->base);
+}
+
+void Connection::on_dst_read(uv_stream_t* socket, ssize_t nread, const uv_buf_t* buf)
+{
+    Connection* conn = static_cast<Connection*>(socket->data);
+    if(nread < 0)
+    {
+        conn->close();
+    }
+    else if(nread == 0)
+    {
+        conn->close();
+        // really?
+    }
+    else
+    {
+        conn->write_to_peer(conn->socket, buf->base, nread);
+    }
+
+    if(buf->base) free(buf->base);
 }
 
 void Connection::on_write(uv_write_t* req, int status)
 {
-	//write_req* wr = (write_req*)req->data;
-	// if(wr->buf.base) free(wr->buf.base);
-	free(req);
+    if(status == 0)
+        free(req);
 }
